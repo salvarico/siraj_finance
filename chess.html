@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ajedrez</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #1a1a2e;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            font-family: 'Segoe UI', sans-serif;
+            color: #fff;
+        }
+        #status {
+            font-size: 22px;
+            margin-bottom: 12px;
+            height: 32px;
+        }
+        #board {
+            display: grid;
+            grid-template-columns: repeat(8, 72px);
+            grid-template-rows: repeat(8, 72px);
+            border: 3px solid #e94560;
+            border-radius: 4px;
+            cursor: pointer;
+            user-select: none;
+        }
+        .cell {
+            width: 72px;
+            height: 72px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 48px;
+            line-height: 1;
+            position: relative;
+        }
+        .light { background: #f0d9b5; }
+        .dark { background: #b58863; }
+        .cell.selected { background: #7bc96a !important; }
+        .cell.highlight { background: #f6f669 !important; }
+        .cell.check { box-shadow: inset 0 0 18px 6px rgba(255,0,0,0.6); }
+        .cell:hover { filter: brightness(1.1); }
+        #promotion-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.7);
+            align-items: center;
+            justify-content: center;
+            z-index: 10;
+        }
+        #promotion-box {
+            background: #16213e;
+            border: 2px solid #e94560;
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+        }
+        #promotion-box h3 { margin-bottom: 12px; }
+        #promotion-options { display: flex; gap: 8px; justify-content: center; }
+        #promotion-options span {
+            font-size: 48px;
+            cursor: pointer;
+            padding: 8px;
+            border-radius: 6px;
+            background: #b58863;
+        }
+        #promotion-options span:hover { background: #7bc96a; }
+        #info {
+            margin-top: 12px;
+            font-size: 13px;
+            color: #aaa;
+        }
+    </style>
+</head>
+<body>
+    <div id="status">Turno: Blancas</div>
+    <div id="board"></div>
+    <div id="info">Haz clic en una pieza para seleccionarla y luego en la casilla destino</div>
+
+    <div id="promotion-overlay">
+        <div id="promotion-box">
+            <h3>Promocionar peón</h3>
+            <div id="promotion-options"></div>
+        </div>
+    </div>
+
+    <script>
+    (() => {
+        // Piece constants
+        const W = 'w', B = 'b';
+        const KING = 'K', QUEEN = 'Q', ROOK = 'R', BISHOP = 'B', KNIGHT = 'N', PAWN = 'P';
+
+        const UNICODE = {
+            wK: '♔', wQ: '♕', wR: '♖', wB: '♗', wN: '♘', wP: '♙',
+            bK: '♚', bQ: '♛', bR: '♜', bB: '♝', bN: '♞', bP: '♟'
+        };
+
+        // Board state: 8x8 array, each cell null or {color, type}
+        let board = [];
+        let turn = W;
+        let selected = null; // {r, c}
+        let validMoves = []; // [{r, c}]
+        let castlingRights = { wK: true, wQ: true, bK: true, bQ: true };
+        let enPassantTarget = null; // {r, c} or null
+        let pendingPromotion = null; // {fr, fc, tr, tc}
+
+        function initBoard() {
+            const backRank = [ROOK, KNIGHT, BISHOP, QUEEN, KING, BISHOP, KNIGHT, ROOK];
+            board = Array.from({ length: 8 }, () => Array(8).fill(null));
+            for (let c = 0; c < 8; c++) {
+                board[0][c] = { color: B, type: backRank[c] };
+                board[1][c] = { color: B, type: PAWN };
+                board[6][c] = { color: W, type: PAWN };
+                board[7][c] = { color: W, type: backRank[c] };
+            }
+            turn = W;
+            selected = null;
+            validMoves = [];
+            castlingRights = { wK: true, wQ: true, bK: true, bQ: true };
+            enPassantTarget = null;
+        }
+
+        function piece(r, c) { return board[r]?.[c] || null; }
+        function inBounds(r, c) { return r >= 0 && r < 8 && c >= 0 && c < 8; }
+        function opponent(color) { return color === W ? B : W; }
+
+        function findKing(color) {
+            for (let r = 0; r < 8; r++)
+                for (let c = 0; c < 8; c++)
+                    if (board[r][c]?.color === color && board[r][c]?.type === KING)
+                        return { r, c };
+            return null;
+        }
+
+        // Raw moves without check-legality filtering
+        function rawMoves(r, c) {
+            const p = piece(r, c);
+            if (!p) return [];
+            const moves = [];
+            const col = p.color;
+            const opp = opponent(col);
+
+            function addIf(tr, tc) {
+                if (!inBounds(tr, tc)) return false;
+                const target = piece(tr, tc);
+                if (target?.color === col) return false;
+                moves.push({ r: tr, c: tc });
+                return !target; // continue sliding if empty
+            }
+
+            function slide(dirs) {
+                for (const [dr, dc] of dirs)
+                    for (let i = 1; i < 8; i++)
+                        if (!addIf(r + dr * i, c + dc * i)) break;
+            }
+
+            switch (p.type) {
+                case PAWN: {
+                    const dir = col === W ? -1 : 1;
+                    const startRow = col === W ? 6 : 1;
+                    // Forward
+                    if (inBounds(r + dir, c) && !piece(r + dir, c)) {
+                        moves.push({ r: r + dir, c });
+                        if (r === startRow && !piece(r + 2 * dir, c))
+                            moves.push({ r: r + 2 * dir, c });
+                    }
+                    // Captures
+                    for (const dc of [-1, 1]) {
+                        const tr = r + dir, tc = c + dc;
+                        if (inBounds(tr, tc)) {
+                            if (piece(tr, tc)?.color === opp)
+                                moves.push({ r: tr, c: tc });
+                            if (enPassantTarget && enPassantTarget.r === tr && enPassantTarget.c === tc)
+                                moves.push({ r: tr, c: tc });
+                        }
+                    }
+                    break;
+                }
+                case KNIGHT:
+                    for (const [dr, dc] of [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]])
+                        addIf(r + dr, c + dc);
+                    break;
+                case BISHOP:
+                    slide([[-1,-1],[-1,1],[1,-1],[1,1]]);
+                    break;
+                case ROOK:
+                    slide([[-1,0],[1,0],[0,-1],[0,1]]);
+                    break;
+                case QUEEN:
+                    slide([[-1,-1],[-1,1],[1,-1],[1,1],[-1,0],[1,0],[0,-1],[0,1]]);
+                    break;
+                case KING:
+                    for (const [dr, dc] of [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]])
+                        addIf(r + dr, c + dc);
+                    // Castling
+                    if (!isAttacked(r, c, opp)) {
+                        const row = col === W ? 7 : 0;
+                        if (r === row && c === 4) {
+                            // Kingside
+                            const ksKey = col + 'K';
+                            if (castlingRights[ksKey] && !piece(row, 5) && !piece(row, 6)
+                                && piece(row, 7)?.type === ROOK && piece(row, 7)?.color === col
+                                && !isAttacked(row, 5, opp) && !isAttacked(row, 6, opp))
+                                moves.push({ r: row, c: 6 });
+                            // Queenside
+                            const qsKey = col + 'Q';
+                            if (castlingRights[qsKey] && !piece(row, 3) && !piece(row, 2) && !piece(row, 1)
+                                && piece(row, 0)?.type === ROOK && piece(row, 0)?.color === col
+                                && !isAttacked(row, 3, opp) && !isAttacked(row, 2, opp))
+                                moves.push({ r: row, c: 2 });
+                        }
+                    }
+                    break;
+            }
+            return moves;
+        }
+
+        function isAttacked(r, c, byColor) {
+            // Check if square (r,c) is attacked by byColor
+            for (let rr = 0; rr < 8; rr++)
+                for (let cc = 0; cc < 8; cc++)
+                    if (board[rr][cc]?.color === byColor) {
+                        const p = board[rr][cc];
+                        // Use simplified attack check to avoid infinite recursion (no castling)
+                        const moves = attackMoves(rr, cc, p);
+                        if (moves.some(m => m.r === r && m.c === c)) return true;
+                    }
+            return false;
+        }
+
+        // Attack squares (no castling, for check detection)
+        function attackMoves(r, c, p) {
+            const moves = [];
+            const col = p.color;
+
+            function addIf(tr, tc) {
+                if (!inBounds(tr, tc)) return false;
+                const target = piece(tr, tc);
+                if (target?.color === col) return false;
+                moves.push({ r: tr, c: tc });
+                return !target;
+            }
+            function slide(dirs) {
+                for (const [dr, dc] of dirs)
+                    for (let i = 1; i < 8; i++)
+                        if (!addIf(r + dr * i, c + dc * i)) break;
+            }
+
+            switch (p.type) {
+                case PAWN: {
+                    const dir = col === W ? -1 : 1;
+                    for (const dc of [-1, 1])
+                        if (inBounds(r + dir, c + dc))
+                            moves.push({ r: r + dir, c: c + dc });
+                    break;
+                }
+                case KNIGHT:
+                    for (const [dr, dc] of [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]])
+                        if (inBounds(r + dr, c + dc)) addIf(r + dr, c + dc);
+                    break;
+                case BISHOP: slide([[-1,-1],[-1,1],[1,-1],[1,1]]); break;
+                case ROOK: slide([[-1,0],[1,0],[0,-1],[0,1]]); break;
+                case QUEEN: slide([[-1,-1],[-1,1],[1,-1],[1,1],[-1,0],[1,0],[0,-1],[0,1]]); break;
+                case KING:
+                    for (const [dr, dc] of [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]])
+                        if (inBounds(r + dr, c + dc)) addIf(r + dr, c + dc);
+                    break;
+            }
+            return moves;
+        }
+
+        function inCheck(color) {
+            const k = findKing(color);
+            return k && isAttacked(k.r, k.c, opponent(color));
+        }
+
+        // Legal moves: filter raw moves that leave own king in check
+        function legalMoves(r, c) {
+            const p = piece(r, c);
+            if (!p) return [];
+            const moves = rawMoves(r, c);
+            return moves.filter(m => {
+                // Simulate move
+                const captured = board[m.r][m.c];
+                const orig = board[r][c];
+                board[m.r][m.c] = orig;
+                board[r][c] = null;
+
+                // En passant capture
+                let epCaptured = null;
+                let epR = -1, epC = -1;
+                if (orig.type === PAWN && enPassantTarget && m.r === enPassantTarget.r && m.c === enPassantTarget.c) {
+                    epR = r; epC = m.c;
+                    epCaptured = board[epR][epC];
+                    board[epR][epC] = null;
+                }
+
+                const legal = !inCheck(orig.color);
+
+                // Undo
+                board[r][c] = orig;
+                board[m.r][m.c] = captured;
+                if (epCaptured) board[epR][epC] = epCaptured;
+
+                return legal;
+            });
+        }
+
+        function hasAnyLegalMove(color) {
+            for (let r = 0; r < 8; r++)
+                for (let c = 0; c < 8; c++)
+                    if (board[r][c]?.color === color && legalMoves(r, c).length > 0)
+                        return true;
+            return false;
+        }
+
+        function executeMove(fr, fc, tr, tc, promotionType) {
+            const p = board[fr][fc];
+            const col = p.color;
+
+            // En passant capture
+            if (p.type === PAWN && enPassantTarget && tr === enPassantTarget.r && tc === enPassantTarget.c) {
+                board[fr][tc] = null;
+            }
+
+            // Update en passant target
+            if (p.type === PAWN && Math.abs(tr - fr) === 2) {
+                enPassantTarget = { r: (fr + tr) / 2, c: fc };
+            } else {
+                enPassantTarget = null;
+            }
+
+            // Castling move
+            if (p.type === KING && Math.abs(tc - fc) === 2) {
+                const row = fr;
+                if (tc === 6) { // Kingside
+                    board[row][5] = board[row][7];
+                    board[row][7] = null;
+                } else { // Queenside
+                    board[row][3] = board[row][0];
+                    board[row][0] = null;
+                }
+            }
+
+            // Update castling rights
+            if (p.type === KING) {
+                castlingRights[col + 'K'] = false;
+                castlingRights[col + 'Q'] = false;
+            }
+            if (p.type === ROOK) {
+                const row = col === W ? 7 : 0;
+                if (fr === row && fc === 0) castlingRights[col + 'Q'] = false;
+                if (fr === row && fc === 7) castlingRights[col + 'K'] = false;
+            }
+            // If a rook is captured
+            if (board[tr][tc]?.type === ROOK) {
+                const capCol = board[tr][tc].color;
+                const capRow = capCol === W ? 7 : 0;
+                if (tr === capRow && tc === 0) castlingRights[capCol + 'Q'] = false;
+                if (tr === capRow && tc === 7) castlingRights[capCol + 'K'] = false;
+            }
+
+            // Move piece
+            board[tr][tc] = p;
+            board[fr][fc] = null;
+
+            // Promotion
+            if (p.type === PAWN && (tr === 0 || tr === 7)) {
+                board[tr][tc] = { color: col, type: promotionType || QUEEN };
+            }
+
+            // Switch turn
+            turn = opponent(turn);
+        }
+
+        // --- UI ---
+        const boardEl = document.getElementById('board');
+        const statusEl = document.getElementById('status');
+        const promoOverlay = document.getElementById('promotion-overlay');
+        const promoOptions = document.getElementById('promotion-options');
+
+        function render() {
+            boardEl.innerHTML = '';
+            const kingPos = findKing(turn);
+            const isInCheck = inCheck(turn);
+
+            for (let r = 0; r < 8; r++) {
+                for (let c = 0; c < 8; c++) {
+                    const cell = document.createElement('div');
+                    cell.className = 'cell ' + ((r + c) % 2 === 0 ? 'light' : 'dark');
+
+                    if (selected && selected.r === r && selected.c === c)
+                        cell.classList.add('selected');
+
+                    if (validMoves.some(m => m.r === r && m.c === c))
+                        cell.classList.add('highlight');
+
+                    if (isInCheck && kingPos && kingPos.r === r && kingPos.c === c)
+                        cell.classList.add('check');
+
+                    const p = piece(r, c);
+                    if (p) cell.textContent = UNICODE[p.color + p.type];
+
+                    cell.addEventListener('click', () => onCellClick(r, c));
+                    boardEl.appendChild(cell);
+                }
+            }
+
+            // Status
+            const colorName = turn === W ? 'Blancas' : 'Negras';
+            if (!hasAnyLegalMove(turn)) {
+                if (isInCheck) {
+                    const winner = turn === W ? 'Negras' : 'Blancas';
+                    statusEl.textContent = `¡Jaque mate! Ganan ${winner}`;
+                } else {
+                    statusEl.textContent = '¡Tablas por ahogado!';
+                }
+            } else if (isInCheck) {
+                statusEl.textContent = `Turno: ${colorName} — ¡Jaque!`;
+            } else {
+                statusEl.textContent = `Turno: ${colorName}`;
+            }
+        }
+
+        function onCellClick(r, c) {
+            if (pendingPromotion) return;
+
+            // If a move target is clicked
+            if (selected && validMoves.some(m => m.r === r && m.c === c)) {
+                const fr = selected.r, fc = selected.c;
+                const p = piece(fr, fc);
+
+                // Check promotion
+                if (p.type === PAWN && (r === 0 || r === 7)) {
+                    pendingPromotion = { fr, fc, tr: r, tc: c };
+                    showPromotion(p.color);
+                    return;
+                }
+
+                executeMove(fr, fc, r, c);
+                selected = null;
+                validMoves = [];
+                render();
+                return;
+            }
+
+            // Select a piece
+            const p = piece(r, c);
+            if (p && p.color === turn) {
+                const moves = legalMoves(r, c);
+                if (moves.length > 0) {
+                    selected = { r, c };
+                    validMoves = moves;
+                } else {
+                    selected = null;
+                    validMoves = [];
+                }
+            } else {
+                selected = null;
+                validMoves = [];
+            }
+            render();
+        }
+
+        function showPromotion(color) {
+            promoOverlay.style.display = 'flex';
+            promoOptions.innerHTML = '';
+            for (const type of [QUEEN, ROOK, BISHOP, KNIGHT]) {
+                const span = document.createElement('span');
+                span.textContent = UNICODE[color + type];
+                span.addEventListener('click', () => {
+                    promoOverlay.style.display = 'none';
+                    const pm = pendingPromotion;
+                    pendingPromotion = null;
+                    executeMove(pm.fr, pm.fc, pm.tr, pm.tc, type);
+                    selected = null;
+                    validMoves = [];
+                    render();
+                });
+                promoOptions.appendChild(span);
+            }
+        }
+
+        initBoard();
+        render();
+    })();
+    </script>
+</body>
+</html>
